@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guild Participation Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        @media print {
+            .print\:hidden { display: none !important; }
+            .print\:block { display: block !important; }
+            .print\:text-black { color: black !important; }
+        }
+        .animate-fadeIn { animation: fadeIn 0.3s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        
+        /* Custom scrollbar for a more "game-like" UI */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-200">
+    <div id="root"></div>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+        import { getFirestore, doc, setDoc, onSnapshot, getDoc } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+
+        window.firebaseModules = {
+            initializeApp, getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged,
+            getFirestore, doc, setDoc, onSnapshot, getDoc
+        };
+        window.dispatchEvent(new Event('firebaseLoaded'));
+    </script>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect, useMemo } = React;
+
+        // --- Robust Icon Component ---
+        const Icon = ({ name, className = "w-5 h-5" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (iconRef.current && window.lucide) {
+                    const iconData = window.lucide.icons[name];
+                    if (iconData) {
+                        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                        svg.setAttribute('width', '24');
+                        svg.setAttribute('height', '24');
+                        svg.setAttribute('viewBox', '0 0 24 24');
+                        svg.setAttribute('fill', 'none');
+                        svg.setAttribute('stroke', 'currentColor');
+                        svg.setAttribute('stroke-width', '2');
+                        svg.setAttribute('stroke-linecap', 'round');
+                        svg.setAttribute('stroke-linejoin', 'round');
+                        svg.setAttribute('class', className);
+                        
+                        // Handle Lucide icon data structure safely
+                        // Newest Lucide format is [tagName, attributes, children]
+                        const children = iconData[2] || [];
+                        
+                        if (Array.isArray(children)) {
+                            children.forEach((child) => {
+                                if (Array.isArray(child)) {
+                                    const [tag, attrs] = child;
+                                    const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
+                                    if (attrs && typeof attrs === 'object') {
+                                        Object.entries(attrs).forEach(([k, v]) => element.setAttribute(k, v));
+                                    }
+                                    svg.appendChild(element);
+                                }
+                            });
+                        }
+                        
+                        iconRef.current.innerHTML = '';
+                        iconRef.current.appendChild(svg);
+                    }
+                }
+            }, [name, className]);
+            return <span ref={iconRef} className="inline-flex items-center justify-center min-w-[1.25rem] min-h-[1.25rem]"></span>;
+        };
+
+        // --- Initial State ---
+        const initialData = {
+            members: [{ id: 'm1', name: 'Founder' }],
+            eventDefs: [{ id: 'e1', name: 'Raid', points: 10 }],
+            catalog: [{ id: 'c1', itemName: 'Health Potion', cost: 2 }],
+            eventLogs: [],
+            purchases: []
+        };
+
+        function App() {
+            const [activeTab, setActiveTab] = useState('dashboard');
+            const [state, setState] = useState(initialData);
+            const [notification, setNotification] = useState('');
+            const [showSetup, setShowSetup] = useState(false);
+            const [isSyncing, setIsSyncing] = useState(true);
+            const [user, setUser] = useState(null);
+
+            const canvasRef = useRef(null);
+            const fileInputRef = useRef(null);
+
+            // --- Firebase Initialization Logic ---
+            useEffect(() => {
+                const initFirebase = async () => {
+                    if (!window.firebaseModules) return;
+                    const { initializeApp, getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, getFirestore, doc, onSnapshot, setDoc } = window.firebaseModules;
+
+                    let config = null;
+                    try {
+                        if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                            config = JSON.parse(__firebase_config);
+                        }
+                    } catch(e) {}
+                    
+                    if (!config) {
+                        const savedConfig = localStorage.getItem('guild_tracker_config');
+                        if (savedConfig) config = JSON.parse(savedConfig);
+                    }
+
+                    if (!config || !config.apiKey) {
+                        setShowSetup(true);
+                        setIsSyncing(false);
+                        return;
+                    }
+
+                    try {
+                        const app = initializeApp(config);
+                        const auth = getAuth(app);
+                        const db = getFirestore(app);
+                        const appId = typeof __app_id !== 'undefined' ? __app_id : (config.projectId || 'guild-app');
+
+                        // Mandatory Rule 3: Auth Before Queries
+                        const initAuth = async () => {
+                            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                            } else {
+                                await signInAnonymously(auth);
+                            }
+                        };
+                        
+                        await initAuth();
+
+                        onAuthStateChanged(auth, (u) => {
+                            setUser(u);
+                            if (u) {
+                                // Mandatory Rule 1: Strict Paths
+                                const stateDoc = doc(db, 'artifacts', appId, 'public', 'data', 'guild_tracker', 'main_state');
+                                const unsubscribe = onSnapshot(stateDoc, (snap) => {
+                                    if (snap.exists()) {
+                                        setState(snap.data());
+                                    } else {
+                                        // Initialize cloud document if it doesn't exist
+                                        setDoc(stateDoc, initialData).catch(console.error);
+                                    }
+                                    setIsSyncing(false);
+                                }, (err) => {
+                                    console.error("Firestore Error:", err);
+                                    setIsSyncing(false);
+                                });
+                                return () => unsubscribe();
+                            }
+                        });
+                        
+                        window.dbInstance = db;
+                        window.appIdInstance = appId;
+                    } catch (e) {
+                        console.error("Firebase Init Error:", e);
+                        setShowSetup(true);
+                    }
+                };
+
+                initFirebase();
+            }, []);
+
+            const saveToCloud = async (newState) => {
+                setState(newState);
+                if (user && window.dbInstance && window.appIdInstance) {
+                    const { doc, setDoc } = window.firebaseModules;
+                    const stateDoc = doc(window.dbInstance, 'artifacts', window.appIdInstance, 'public', 'data', 'guild_tracker', 'main_state');
+                    try {
+                        await setDoc(stateDoc, newState, { merge: true });
+                    } catch (e) {
+                        console.error("Error saving to cloud:", e);
+                    }
+                }
+            };
+
+            const notify = (msg) => {
+                setNotification(msg);
+                setTimeout(() => setNotification(''), 3000);
+            };
+
+            // --- Analysis ---
+            const balances = useMemo(() => {
+                return (state.members || []).map(m => {
+                    const earned = (state.eventLogs || []).filter(l => l.participantId === m.id).reduce((s, l) => s + l.points, 0);
+                    const spent = (state.purchases || []).filter(p => p.buyerId === m.id).reduce((s, p) => s + p.pointsSpent, 0);
+                    return { ...m, earned, spent, balance: earned - spent };
+                }).sort((a, b) => b.balance - a.balance);
+            }, [state]);
+
+            const stats = useMemo(() => {
+                const earned = (state.eventLogs || []).reduce((s, l) => s + l.points, 0);
+                const spent = (state.purchases || []).reduce((s, p) => s + p.pointsSpent, 0);
+                return { earned, spent, circ: earned - spent };
+            }, [state]);
+
+            // --- Handlers ---
+            const handleBulkLog = (e, selectedMembers, eventId, customName, customPoints, date) => {
+                e.preventDefault();
+                let name = customName;
+                let pts = parseInt(customPoints) || 0;
+                if (eventId !== 'custom') {
+                    const def = state.eventDefs.find(d => d.id === eventId);
+                    name = def.name;
+                    pts = def.points;
+                }
+                const newLogs = selectedMembers.map(mid => ({
+                    id: Math.random().toString(36).substr(2, 9),
+                    date, eventName: name, participantId: mid, points: pts
+                }));
+                saveToCloud({ ...state, eventLogs: [...(state.eventLogs || []), ...newLogs] });
+                notify(`Logged ${name} for ${selectedMembers.length} members.`);
+            };
+
+            const generateImage = () => {
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                canvas.width = 800;
+                canvas.height = 200 + (balances.length * 40);
+                ctx.fillStyle = '#0f172a'; ctx.fillRect(0,0,800,canvas.height);
+                ctx.fillStyle = '#38bdf8'; ctx.font = 'bold 30px sans-serif'; ctx.fillText('Guild Leaderboard', 40, 60);
+                ctx.fillStyle = '#94a3b8'; ctx.font = '16px sans-serif'; ctx.fillText(`Date: ${new Date().toLocaleDateString()}`, 40, 90);
+                ctx.fillStyle = '#f8fafc'; ctx.font = 'bold 18px sans-serif';
+                ctx.fillText('Member', 40, 150); ctx.fillText('Earned', 300, 150); ctx.fillText('Spent', 450, 150); ctx.fillText('Balance', 600, 150);
+                ctx.strokeStyle = '#334155'; ctx.beginPath(); ctx.moveTo(40,165); ctx.lineTo(760,165); ctx.stroke();
+                ctx.font = '16px sans-serif';
+                balances.forEach((m, i) => {
+                    const y = 200 + (i * 40);
+                    ctx.fillStyle = '#e2e8f0'; ctx.fillText(m.name, 40, y);
+                    ctx.fillStyle = '#4ade80'; ctx.fillText(m.earned.toString(), 300, y);
+                    ctx.fillStyle = '#f87171'; ctx.fillText(m.spent.toString(), 450, y);
+                    ctx.fillStyle = '#fbbf24'; ctx.fillText(m.balance.toString(), 600, y);
+                });
+                const link = document.createElement('a');
+                link.download = 'Guild_Report.png';
+                link.href = canvas.toDataURL();
+                link.click();
+                notify("Graphic downloaded!");
+            };
+
+            if (showSetup) return <SetupScreen onComplete={() => window.location.reload()} />;
+
+            return (
+                <div className="flex h-screen bg-slate-900">
+                    {/* Sidebar */}
+                    <aside className="w-64 bg-slate-800 border-r border-slate-700 flex flex-col print:hidden">
+                        <div className="p-6 border-b border-slate-700 flex items-center gap-2">
+                            <Icon name="Users" className="text-sky-400" />
+                            <h1 className="text-xl font-bold text-white">GuildSync</h1>
+                        </div>
+                        <nav className="flex-1 p-4 space-y-1">
+                            <TabBtn active={activeTab==='dashboard'} onClick={()=>setActiveTab('dashboard')} icon="BarChart3" label="Dashboard" />
+                            <TabBtn active={activeTab==='bulk'} onClick={()=>setActiveTab('bulk')} icon="CheckSquare" label="Bulk Log" />
+                            <TabBtn active={activeTab==='gbank'} onClick={()=>setActiveTab('gbank')} icon="ShoppingBag" label="Guild Bank" />
+                            <TabBtn active={activeTab==='settings'} onClick={()=>setActiveTab('settings')} icon="Settings" label="Roster & Rules" />
+                        </nav>
+                        <div className="p-4 border-t border-slate-700 space-y-2">
+                            <button onClick={generateImage} className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 py-2 rounded text-sm font-bold transition-all"><Icon name="Image" /> Share Image</button>
+                            <div className="flex gap-2">
+                                <button onClick={() => {
+                                    const blob = new Blob([JSON.stringify(state, null, 2)], {type:'application/json'});
+                                    const url = URL.createObjectURL(blob);
+                                    const a = document.createElement('a'); a.href=url; a.download='GuildData.json'; a.click();
+                                }} className="flex-1 bg-slate-700 hover:bg-slate-600 py-2 rounded text-xs font-bold transition-all flex items-center justify-center gap-1"><Icon name="Download" /> Backup</button>
+                                <button onClick={()=>fileInputRef.current.click()} className="flex-1 bg-slate-700 hover:bg-slate-600 py-2 rounded text-xs font-bold transition-all flex items-center justify-center gap-1"><Icon name="Upload" /> Import</button>
+                            </div>
+                        </div>
+                    </aside>
+
+                    {/* Main */}
+                    <main className="flex-1 overflow-auto p-8 relative">
+                        <div className="absolute top-4 right-8 flex items-center gap-4 z-20">
+                            {isSyncing ? <span className="text-amber-400 text-xs animate-pulse">Syncing...</span> : <span className="text-emerald-400 text-xs">Cloud Active</span>}
+                            {notification && <div className="bg-emerald-600 text-white px-4 py-2 rounded shadow-lg animate-fadeIn text-sm">{notification}</div>}
+                        </div>
+
+                        <canvas ref={canvasRef} className="hidden" />
+                        <input type="file" ref={fileInputRef} className="hidden" accept=".json" onChange={(e) => {
+                            if (!e.target.files[0]) return;
+                            const reader = new FileReader();
+                            reader.onload = (ev) => {
+                                try {
+                                    const d = JSON.parse(ev.target.result);
+                                    if(d.members) { saveToCloud(d); notify("Data Imported!"); }
+                                } catch(err) { notify("Invalid File"); }
+                            };
+                            reader.readAsText(e.target.files[0]);
+                        }} />
+
+                        {activeTab === 'dashboard' && <Dashboard stats={stats} balances={balances} />}
+                        {activeTab === 'bulk' && <BulkForm members={state.members || []} eventDefs={state.eventDefs || []} onSubmit={handleBulkLog} />}
+                        {activeTab === 'gbank' && <GBank catalog={state.catalog || []} members={state.members || []} purchases={state.purchases || []} state={state} saveToCloud={saveToCloud} notify={notify} />}
+                        {activeTab === 'settings' && <SettingsPanel state={state} saveToCloud={saveToCloud} />}
+                    </main>
+                </div>
+            );
+        }
+
+        // --- UI Components ---
+        function TabBtn({ active, onClick, icon, label }) {
+            return (
+                <button onClick={onClick} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${active ? 'bg-sky-500/20 text-sky-400 border-l-4 border-sky-400' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
+                    <Icon name={icon} />
+                    <span className="font-semibold">{label}</span>
+                </button>
+            );
+        }
+
+        function Dashboard({ stats, balances }) {
+            return (
+                <div className="space-y-8 animate-fadeIn">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <StatCard title="Circulation" val={stats.circ} color="text-sky-400" />
+                        <StatCard title="Total Earned" val={stats.earned} color="text-emerald-400" />
+                        <StatCard title="Total Spent" val={stats.spent} color="text-rose-400" />
+                    </div>
+                    <div className="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-2xl">
+                        <div className="p-4 bg-slate-900/50 border-b border-slate-700"><h2 className="font-bold">Officer Oversight: Member Balances</h2></div>
+                        <table className="w-full text-left">
+                            <thead className="bg-slate-900/30 text-slate-500 text-xs uppercase tracking-widest">
+                                <tr><th className="p-4">Rank</th><th className="p-4">Name</th><th className="p-4">Earned</th><th className="p-4">Spent</th><th className="p-4">Balance</th></tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700/50">
+                                {balances.map((m, i) => (
+                                    <tr key={m.id} className="hover:bg-slate-700/30 transition-colors">
+                                        <td className="p-4 text-slate-500 font-mono">#{i+1}</td>
+                                        <td className="p-4 font-bold text-white">{m.name}</td>
+                                        <td className="p-4 text-emerald-400">+{m.earned}</td>
+                                        <td className="p-4 text-rose-400">-{m.spent}</td>
+                                        <td className="p-4 font-black text-amber-400">{m.balance}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        }
+
+        function StatCard({ title, val, color }) {
+            return (
+                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+                    <h3 className="text-slate-500 text-xs uppercase font-bold tracking-widest">{title}</h3>
+                    <p className={`text-4xl font-black mt-2 ${color}`}>{val}</p>
+                </div>
+            );
+        }
+
+        function BulkForm({ members, eventDefs, onSubmit }) {
+            const [selected, setSelected] = useState([]);
+            const [evId, setEvId] = useState(eventDefs[0]?.id || 'custom');
+            const [cName, setCName] = useState('');
+            const [cPts, setCPts] = useState('');
+            const [date, setDate] = useState(new Date().toISOString().slice(0,10));
+
+            return (
+                <form className="max-w-2xl bg-slate-800 p-8 rounded-2xl border border-slate-700 shadow-2xl space-y-6" onSubmit={(e) => { onSubmit(e, selected, evId, cName, cPts, date); setSelected([]); }}>
+                    <h2 className="text-2xl font-bold">Bulk Participation Entry</h2>
+                    <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                            <label className="text-xs text-slate-500 uppercase font-bold">Event Date</label>
+                            <input type="date" value={date} onChange={e=>setDate(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white outline-none focus:ring-2 ring-sky-500" />
+                        </div>
+                        <div className="space-y-1">
+                            <label className="text-xs text-slate-500 uppercase font-bold">Event Type</label>
+                            <select value={evId} onChange={e=>setEvId(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white outline-none focus:ring-2 ring-sky-500">
+                                {eventDefs.map(d=><option key={d.id} value={d.id}>{d.name} ({d.points} pts)</option>)}
+                                <option value="custom">Custom Event</option>
+                            </select>
+                        </div>
+                    </div>
+                    {evId==='custom' && (
+                        <div className="grid grid-cols-2 gap-4 animate-fadeIn">
+                            <input placeholder="Event Name" value={cName} onChange={e=>setCName(e.target.value)} className="bg-slate-900 border border-slate-700 p-3 rounded-lg" />
+                            <input type="number" placeholder="Points" value={cPts} onChange={e=>setCPts(e.target.value)} className="bg-slate-900 border border-slate-700 p-3 rounded-lg" />
+                        </div>
+                    )}
+                    <div className="space-y-2">
+                        <div className="flex justify-between items-center"><label className="text-xs text-slate-500 uppercase font-bold tracking-widest">Select Participants ({selected.length})</label><div className="space-x-3 text-xs"><button type="button" onClick={()=>setSelected(members.map(m=>m.id))} className="text-sky-400">All</button><button type="button" onClick={()=>setSelected([])} className="text-slate-500">None</button></div></div>
+                        <div className="bg-slate-900/50 rounded-xl border border-slate-700 p-4 grid grid-cols-2 gap-2 max-h-60 overflow-y-auto">
+                            {members.map(m=>(
+                                <label key={m.id} className="flex items-center gap-3 p-2 hover:bg-slate-800 rounded cursor-pointer transition-colors">
+                                    <input type="checkbox" checked={selected.includes(m.id)} onChange={e=>setSelected(p=>e.target.checked?[...p,m.id]:p.filter(x=>x!==m.id))} className="w-4 h-4 rounded border-slate-700 bg-slate-900 text-sky-500 focus:ring-sky-500" />
+                                    <span className="text-sm">{m.name}</span>
+                                </label>
+                            ))}
+                        </div>
+                    </div>
+                    <button type="submit" className="w-full bg-sky-600 hover:bg-sky-500 text-white font-black py-4 rounded-xl shadow-lg transition-all active:scale-95">SUBMIT PARTICIPATION LOG</button>
+                </form>
+            );
+        }
+
+        function GBank({ catalog, members, state, saveToCloud, notify }) {
+            const [item, setItem] = useState(catalog[0]?.id || '');
+            const [buyer, setBuyer] = useState(members[0]?.id || '');
+            const [newItem, setNewItem] = useState({ name: '', cost: '' });
+
+            return (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-fadeIn">
+                    <div className="space-y-6">
+                        <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+                            <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Icon name="ShoppingBag" /> Log Purchase</h2>
+                            <div className="space-y-4">
+                                <select value={buyer} onChange={e=>setBuyer(e.target.value)} className="w-full bg-slate-900 border border-slate-700 p-3 rounded-lg text-white">
+                                    {members.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+                                </select>
+                                <select value={item} onChange={e=>setItem(e.target.value)} className="w-full bg-slate-900 border border-slate-700 p-3 rounded-lg text-white">
+                                    {catalog.map(c=><option key={c.id} value={c.id}>{c.itemName} ({c.cost} pts)</option>)}
+                                </select>
+                                <button onClick={()=>{
+                                    const catItem = catalog.find(x=>x.id===item);
+                                    if(!catItem) return;
+                                    const p = { id: Date.now(), date: new Date().toISOString().slice(0,10), itemName: catItem.itemName, buyerId: buyer, pointsSpent: catItem.cost };
+                                    saveToCloud({...state, purchases: [...(state.purchases || []), p]});
+                                    notify("Purchase recorded.");
+                                }} className="w-full bg-rose-600 hover:bg-rose-500 py-3 rounded-lg font-bold">DEDUCT POINTS</button>
+                            </div>
+                        </div>
+                        <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+                            <h2 className="text-xl font-bold mb-4">Manage Catalog</h2>
+                            <div className="flex gap-2 mb-4">
+                                <input placeholder="Item" value={newItem.name} onChange={e=>setNewItem({...newItem, name:e.target.value})} className="flex-1 bg-slate-900 border border-slate-700 p-2 rounded" />
+                                <input placeholder="Cost" type="number" value={newItem.cost} onChange={e=>setNewItem({...newItem, cost:e.target.value})} className="w-20 bg-slate-900 border border-slate-700 p-2 rounded" />
+                                <button onClick={()=>{
+                                    if(!newItem.name || !newItem.cost) return;
+                                    saveToCloud({...state, catalog: [...(state.catalog || []), {id: Date.now(), itemName: newItem.name, cost: parseInt(newItem.cost)}]});
+                                    setNewItem({name:'', cost:''});
+                                }} className="bg-emerald-600 px-4 rounded font-bold">Add</button>
+                            </div>
+                            <div className="space-y-2 max-h-60 overflow-y-auto">
+                                {catalog.map(c=>(
+                                    <div key={c.id} className="flex justify-between p-2 bg-slate-900/50 rounded text-sm border border-slate-700/50 items-center">
+                                        <span>{c.itemName}</span>
+                                        <div className="flex items-center gap-4">
+                                            <span className="font-bold text-amber-400">{c.cost} pts</span>
+                                            <button onClick={()=>saveToCloud({...state, catalog: catalog.filter(x=>x.id!==c.id)})}><Icon name="Trash2" className="w-4 h-4 text-slate-500 hover:text-rose-500"/></button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                    <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg print:bg-white print:text-black">
+                        <div className="flex justify-between items-center mb-6 print:hidden"><h2 className="text-xl font-bold">Live Catalog</h2><button onClick={()=>window.print()} className="p-2 bg-slate-700 rounded"><Icon name="Printer" /></button></div>
+                        <div className="space-y-4">
+                            {catalog.map(c=>(
+                                <div key={c.id} className="flex justify-between border-b border-slate-700 pb-2 print:border-slate-300">
+                                    <span className="font-bold text-lg">{c.itemName}</span>
+                                    <span className="text-sky-400 font-mono font-bold text-lg print:text-black">{c.cost} PTS</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function SettingsPanel({ state, saveToCloud }) {
+            const [mName, setMName] = useState('');
+            const [eName, setEName] = useState('');
+            const [ePts, setEPts] = useState('');
+
+            const members = state.members || [];
+            const eventDefs = state.eventDefs || [];
+
+            return (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-8 animate-fadeIn">
+                    <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
+                        <h2 className="text-xl font-bold mb-4">Guild Roster</h2>
+                        <div className="flex gap-2 mb-6">
+                            <input placeholder="Member Name" value={mName} onChange={e=>setMName(e.target.value)} className="flex-1 bg-slate-900 border border-slate-700 p-3 rounded-lg text-white" />
+                            <button onClick={()=>{
+                                if(!mName) return;
+                                saveToCloud({...state, members: [...members, {id: Date.now().toString(), name: mName}]});
+                                setMName('');
+                            }} className="bg-sky-600 px-6 rounded-lg font-bold">Add</button>
+                        </div>
+                        <div className="space-y-2 max-h-96 overflow-y-auto">
+                            {members.map(m=>(
+                                <div key={m.id} className="flex justify-between p-3 bg-slate-900 rounded-lg border border-slate-700 items-center">
+                                    <span className="font-medium">{m.name}</span>
+                                    <button onClick={()=>saveToCloud({...state, members: members.filter(x=>x.id!==m.id)})} className="text-slate-500 hover:text-rose-500 transition-colors"><Icon name="Trash2" className="w-4 h-4" /></button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                    <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
+                        <h2 className="text-xl font-bold mb-4">Event Presets</h2>
+                        <div className="flex gap-2 mb-6">
+                            <input placeholder="Event" value={eName} onChange={e=>setEName(e.target.value)} className="flex-1 bg-slate-900 border border-slate-700 p-3 rounded-lg text-white" />
+                            <input placeholder="Pts" type="number" value={ePts} onChange={e=>setEPts(e.target.value)} className="w-20 bg-slate-900 border border-slate-700 p-3 rounded-lg text-white" />
+                            <button onClick={()=>{
+                                if(!eName || !ePts) return;
+                                saveToCloud({...state, eventDefs: [...eventDefs, {id: Date.now().toString(), name: eName, points: parseInt(ePts)}]});
+                                setEName(''); setEPts('');
+                            }} className="bg-emerald-600 px-6 rounded-lg font-bold">Add</button>
+                        </div>
+                        <div className="space-y-2 max-h-96 overflow-y-auto">
+                            {eventDefs.map(e=>(
+                                <div key={e.id} className="flex justify-between p-3 bg-slate-900 rounded-lg border border-slate-700 items-center">
+                                    <div className="flex flex-col">
+                                        <span className="font-medium">{e.name}</span>
+                                        <span className="text-xs text-emerald-400 font-bold">{e.points} Points</span>
+                                    </div>
+                                    <button onClick={()=>saveToCloud({...state, eventDefs: eventDefs.filter(x=>x.id!==e.id)})} className="text-slate-500 hover:text-rose-500 transition-colors"><Icon name="Trash2" className="w-4 h-4" /></button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function SetupScreen({ onComplete }) {
+            const [configStr, setConfigStr] = useState('');
+            return (
+                <div className="flex items-center justify-center h-screen p-8 bg-slate-950">
+                    <div className="max-w-md w-full bg-slate-800 p-8 rounded-3xl border border-slate-700 shadow-2xl space-y-6">
+                        <div className="text-center">
+                            <Icon name="Cloud" className="w-12 h-12 text-sky-400 mx-auto mb-4" />
+                            <h1 className="text-2xl font-bold">First Time Sync Setup</h1>
+                            <p className="text-slate-400 text-sm mt-2">Paste your Firebase Web Config object here to link this app to your guild database.</p>
+                        </div>
+                        <textarea value={configStr} onChange={e=>setConfigStr(e.target.value)} placeholder="Paste config here..." className="w-full h-40 bg-slate-900 border border-slate-700 rounded-xl p-4 font-mono text-xs text-sky-200 outline-none focus:ring-2 ring-sky-500" />
+                        <button onClick={()=>{
+                            try {
+                                const startIdx = configStr.indexOf('{');
+                                const endIdx = configStr.lastIndexOf('}');
+                                if (startIdx === -1 || endIdx === -1) throw new Error("Invalid format");
+                                const json = configStr.slice(startIdx, endIdx + 1);
+                                JSON.parse(json); // Validate
+                                localStorage.setItem('guild_tracker_config', json);
+                                onComplete();
+                            } catch(e) { alert("Invalid Configuration Object. Please paste the full JSON config."); }
+                        }} className="w-full bg-sky-600 py-4 rounded-xl font-black text-white hover:bg-sky-500 transition-all shadow-lg">CONNECT DATABASE</button>
+                        <p className="text-slate-500 text-[10px] text-center italic">Create a free Firebase project at console.firebase.google.com to get your keys.</p>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
